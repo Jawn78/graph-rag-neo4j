@@ -66,7 +66,3 @@ python -m graph_rag check
 - `setup start`: Start server components
 - `setup verify`: Check dependencies
 - `help`: Show command documentation
-
-## License
-
-MIT
