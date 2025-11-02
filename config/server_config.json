@@ -1,0 +1,23 @@
+{
+    "chat_server": {
+        "model_path": "D:/models/llama-2-7b-chat.Q4_K_M.gguf",
+        "host": "127.0.0.1",
+        "port": 8081,
+        "n_gpu_layers": 32,
+        "n_threads": 8,
+        "chat_format": "chatml",
+        "n_ctx": 2048,
+        "n_batch": 512,
+        "verbose": true
+    },
+    "embedding_server": {
+        "model_path": "F:/Models/Qwen3-Embedding-8B-Q6_K.gguf",
+        "host": "127.0.0.1",
+        "port": 8080,
+        "model_alias": "qwen3-embed-0.6b",
+        "embedding": true,
+        "n_gpu_layers": -1,
+        "n_threads": 8,
+        "verbose": true
+    }
+}

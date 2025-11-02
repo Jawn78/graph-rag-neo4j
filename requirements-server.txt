@@ -1,0 +1,11 @@
+# Dependencies needed to run the local llama_cpp.server (kept separate to avoid conflicts)
+fastapi==0.103.2
+uvicorn==0.22.0
+# Use an sse-starlette release compatible with anyio<4 (used by FastAPI 0.103.2)
+# Pick a 1.x release that uses anyio 3.x
+sse-starlette==1.8.2
+starlette-context==0.3.2
+anyio==3.7.1
+# Use a more recent pydantic-settings 2.x that is compatible with PyYAML 6.0
+pyyaml==6.0
+pydantic-settings==2.3.0

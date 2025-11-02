@@ -1,0 +1,21 @@
+# Pinned, tested dependency set for this project (use with setup_env.py)
+# Adjust versions if you have specific needs.
+
+llama-cpp-python==0.3.16
+numpy==1.26.4
+diskcache==5.6.3
+jinja2==3.1.6
+MarkupSafe==2.1.3
+python-dotenv==1.0.0
+openai==1.40.0
+neo4j==5.20.0
+pypdf==4.0.0
+docx2txt==0.9
+chardet==5.2.0
+psutil==5.9.0
+requests==2.31.0
+
+# Optional extras you can enable if needed:
+# gradio==3.50.2
+# chromadb==0.4.6
+# langchain==0.0.327

@@ -1,0 +1,41 @@
+python-dotenv>=1.0
+openai>=1.40
+neo4j>=5.20
+pypdf>=4.0
+docx2txt>=0.8
+chardet>=5.2
+# CUDA 12.5 build requirements
+# Supported architectures: 
+# - RTX 30 Series (Ampere): 86
+# - RTX 20 Series (Turing): 75
+# - RTX 40 Series (Ada Lovelace): 89
+llama-cpp-python==0.3.16  # Set before install: $env:CMAKE_ARGS='-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=75;80;86;89 -DCUDA_TOOLKIT_ROOT_DIR="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.5"'
+
+# Core dependencies
+numpy>=2.3.4
+diskcache>=5.6.3
+psutil>=5.9.0
+requests>=2.28.0
+nvidia-ml-py>=12.535.77  # For GPU monitoring (optional)
+
+# Server dependencies
+uvicorn==0.38.0  # For serving llama-cpp-python API server
+fastapi==0.120.4  # Required by llama-cpp-python server
+starlette>=0.36.0  # Required by llama-cpp-python server
+sse-starlette>=1.8.0  # Required by llama-cpp-python server
+starlette-context>=0.3.0  # Required by llama-cpp-python server
+pydantic-settings>=2.2.0  # Required by llama-cpp-python server
+
+# Core dependencies
+requests>=2.31.0  # For health checks
+click>=8.1.0  # For CLI interface
+pydantic>=2.0.0  # For config validation
+rich>=13.0.0  # For beautiful CLI output
+
+# Development dependencies
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-asyncio>=0.21.0  # For async test support
+
+# Optional dependencies
+torch>=2.0.0; platform_system == "Windows"  # Optional: For CUDA verification on Windows

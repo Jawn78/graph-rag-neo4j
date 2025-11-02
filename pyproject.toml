@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graph_rag2"
+version = "0.1.0"
+description = "A Graph-based RAG system using Neo4j"
+requires-python = ">=3.8"
+dependencies = [
+    "click>=8.1.0",
+    "rich>=13.0.0",
+]
+
+[tool.setuptools]
+packages = ["graph_rag"]
