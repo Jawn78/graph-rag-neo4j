@@ -736,3 +736,379 @@ def _get_intent_user_prompt(intent, question: str, context: str) -> str:
         return f"List the items requested, using the context.\n\n{base}"
 
     return f"Answer the following question using ONLY the context below. Be concise.\n\n{base}"
+
+
+# ============================================================================
+# FULL CONTEXT ENGINE INTEGRATION (All Phases)
+# ============================================================================
+
+@timed("ask_full_context")
+def ask_full_context(driver, question: str, session_id: Optional[str] = None,
+                     user_id: Optional[str] = None, top_k: int = 6,
+                     use_mcp: bool = False, use_llm_context: bool = False,
+                     enable_rerank: bool = True, enable_mmr: bool = True,
+                     enable_filtering: bool = True, enable_personalization: bool = True,
+                     enable_feedback: bool = True) -> Dict[str, Any]:
+    """
+    Full context-aware question answering with all phases integrated.
+
+    This comprehensive function integrates:
+    - Phase 1: Query understanding (intent, rewriting, session)
+    - Phase 2: Reranking with MMR diversity, metadata filtering
+    - Phase 3: Entity extraction, user profile personalization
+    - Phase 4: Feedback logging and analytics
+
+    Args:
+        driver: Neo4j driver
+        question: The question to answer
+        session_id: Optional session ID for conversation tracking
+        user_id: Optional user ID for personalization
+        top_k: Base number of chunks to retrieve
+        use_mcp: Whether to try MCP services
+        use_llm_context: Use LLM for intent/rewriting
+        enable_rerank: Enable cross-encoder reranking
+        enable_mmr: Enable MMR diversity (requires enable_rerank)
+        enable_filtering: Enable metadata filtering
+        enable_personalization: Enable user profile personalization
+        enable_feedback: Enable feedback logging
+
+    Returns:
+        Dict with full result including answer, citations, metrics, etc.
+    """
+    import time
+    import uuid
+
+    from ..context_engine import (
+        get_context_engine, Intent,
+        extract_entities, expand_query_with_entities,
+        rerank_chunks, compute_diversity_score,
+        FilterCriteria, apply_filters, apply_recency_boost,
+        ProfileManager, apply_personalization, get_profile_context,
+        get_feedback_collector
+    )
+
+    trace_id = set_trace_id()
+    query_id = str(uuid.uuid4())
+    start_time = time.time()
+
+    logger.info(f"[{trace_id}] Full context processing: {question[:50]}...")
+
+    # Initialize result structure
+    result = {
+        "answer": "",
+        "citations": [],
+        "used_chunks": [],
+        "intent": None,
+        "rewritten_query": question,
+        "entities": [],
+        "diversity_score": 0.0,
+        "query_id": query_id,
+        "metrics": {}
+    }
+
+    # -------------------------------------------------------------------------
+    # Phase 1: Query Understanding
+    # -------------------------------------------------------------------------
+    engine = get_context_engine(use_llm=use_llm_context)
+    ctx = engine.process_query(question, session_id)
+
+    result["intent"] = ctx.intent.value
+    result["rewritten_query"] = ctx.rewritten_query
+    result["entities"] = ctx.entities
+
+    logger.info(f"[{trace_id}] Intent: {ctx.intent.value}, entities: {ctx.entities[:3]}")
+
+    # Extract entities from query for expansion
+    query_entities = extract_entities(question)
+    entity_strings = [e.text for e in query_entities]
+    result["entities"] = list(set(result["entities"] + entity_strings))
+
+    # Expand query with entity terms
+    effective_query = ctx.rewritten_query
+    if query_entities:
+        effective_query = expand_query_with_entities(effective_query, query_entities)
+        logger.debug(f"[{trace_id}] Entity-expanded query: {effective_query[:80]}...")
+
+    effective_top_k = ctx.top_k
+
+    # -------------------------------------------------------------------------
+    # Phase 3 (partial): Load user profile if available
+    # -------------------------------------------------------------------------
+    user_profile = None
+    profile_context = ""
+    if enable_personalization and user_id:
+        try:
+            profile_manager = ProfileManager()
+            user_profile = profile_manager.get_or_create(user_id)
+            profile_context = get_profile_context(user_profile)
+
+            # Record query in profile
+            profile_manager.record_query(
+                user_id, question, ctx.intent.value,
+                topics=ctx.entities[:5],
+                entities=entity_strings[:5]
+            )
+            logger.debug(f"[{trace_id}] Loaded profile for user: {user_id}")
+        except Exception as e:
+            logger.warning(f"[{trace_id}] Profile loading failed: {e}")
+
+    # -------------------------------------------------------------------------
+    # Embedding
+    # -------------------------------------------------------------------------
+    try:
+        q_emb = embed_client.embeddings.create(
+            model=EMBED_MODEL,
+            input=effective_query,
+            encoding_format="float"
+        ).data[0].embedding
+    except Exception as e:
+        logger.error(f"[{trace_id}] Failed to embed question: {e}")
+        result["error"] = f"Embedding failed: {e}"
+        return result
+
+    # -------------------------------------------------------------------------
+    # Retrieval
+    # -------------------------------------------------------------------------
+    retrieval_start = time.time()
+
+    fts_q = _fts_query_from_question(effective_query)
+    ctx_chunks: List[Dict[str, Any]] = []
+
+    # Anchor on FTS if enabled
+    if ctx.include_neighbors:
+        best = _fts_best_chunk(driver, fts_q)
+        if best:
+            doc_id, ord0 = best
+            ctx_chunks = _neighbor_window(driver, doc_id, ord0, FOCUS_WINDOW)
+
+    # Hybrid search - get more candidates for reranking
+    rerank_multiplier = 3 if enable_rerank else 1
+    try:
+        hyb = hybrid_search(driver, q_emb, fts_q, top_k=effective_top_k * rerank_multiplier) or []
+    except Exception as e:
+        logger.warning(f"[{trace_id}] Hybrid search failed: {e}")
+        hyb = []
+
+    # Merge results
+    seen = {c["chunk_id"] for c in ctx_chunks}
+    for h in hyb:
+        if h["chunk_id"] not in seen:
+            h.setdefault("heading", None)
+            ctx_chunks.append(h)
+            seen.add(h["chunk_id"])
+
+    retrieval_time = (time.time() - retrieval_start) * 1000
+    logger.info(f"[{trace_id}] Retrieved {len(ctx_chunks)} chunks in {retrieval_time:.1f}ms")
+
+    # -------------------------------------------------------------------------
+    # Phase 2: Filtering
+    # -------------------------------------------------------------------------
+    if enable_filtering and ctx_chunks:
+        # Build filter criteria based on intent
+        criteria = FilterCriteria()
+
+        # Require recency for clarification questions
+        if ctx.intent == Intent.CLARIFICATION:
+            criteria.require_recency = True
+            criteria.max_age_days = 365
+
+        # Apply user preference filters
+        if user_profile:
+            if user_profile.preferences.preferred_sources:
+                criteria.allowed_sources = user_profile.preferences.preferred_sources
+            if user_profile.preferences.blocked_sources:
+                criteria.blocked_sources = user_profile.preferences.blocked_sources
+            if user_profile.preferences.preferred_doc_types:
+                criteria.allowed_extensions = user_profile.preferences.preferred_doc_types
+
+        # Apply filters
+        if not criteria.is_empty():
+            pre_filter_count = len(ctx_chunks)
+            ctx_chunks = apply_filters(ctx_chunks, criteria)
+            logger.debug(f"[{trace_id}] Filtered: {pre_filter_count} -> {len(ctx_chunks)}")
+
+        # Apply recency boost
+        ctx_chunks = apply_recency_boost(ctx_chunks)
+
+    # -------------------------------------------------------------------------
+    # Phase 2: Reranking with MMR
+    # -------------------------------------------------------------------------
+    rerank_time = 0.0
+    if enable_rerank and ctx_chunks and q_emb:
+        rerank_start = time.time()
+
+        # Determine lambda based on intent
+        if ctx.intent == Intent.COMPARISON:
+            mmr_lambda = 0.5  # More diversity for comparisons
+        elif ctx.intent == Intent.HOW_TO:
+            mmr_lambda = 0.9  # Less diversity, more coherent steps
+        else:
+            mmr_lambda = 0.7  # Default balance
+
+        ctx_chunks = rerank_chunks(
+            q_emb, ctx_chunks, driver,
+            use_mmr=enable_mmr,
+            lambda_param=mmr_lambda,
+            top_k=effective_top_k
+        )
+
+        rerank_time = (time.time() - rerank_start) * 1000
+        logger.debug(f"[{trace_id}] Reranked to {len(ctx_chunks)} chunks in {rerank_time:.1f}ms")
+
+    # -------------------------------------------------------------------------
+    # Phase 3: Personalization
+    # -------------------------------------------------------------------------
+    if enable_personalization and user_profile and ctx_chunks:
+        ctx_chunks = apply_personalization(ctx_chunks, user_profile)
+        # Re-sort by boosted score if applicable
+        if any("_personalization_boost" in c for c in ctx_chunks):
+            ctx_chunks.sort(
+                key=lambda c: c.get("_score", 0) * c.get("_personalization_boost", 1.0),
+                reverse=True
+            )
+
+    # Compute diversity score
+    diversity_score = 0.0
+    if ctx_chunks:
+        diversity_score = compute_diversity_score(ctx_chunks, driver)
+        result["diversity_score"] = diversity_score
+
+    # -------------------------------------------------------------------------
+    # Heading boost and context building
+    # -------------------------------------------------------------------------
+    _hydrate_headings(driver, ctx_chunks)
+    ctx_chunks = _apply_heading_boost(effective_query, ctx_chunks)
+
+    context_text, citations = _build_context_block_fit_diverse(ctx_chunks)
+    result["citations"] = citations
+    result["used_chunks"] = ctx_chunks
+
+    # -------------------------------------------------------------------------
+    # Build prompt with profile context
+    # -------------------------------------------------------------------------
+    system_prompt = _get_intent_system_prompt(ctx.intent)
+    if profile_context:
+        system_prompt = f"{system_prompt}\n\nUser context:\n{profile_context}"
+
+    user_prompt = _get_intent_user_prompt(ctx.intent, question, context_text)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    # -------------------------------------------------------------------------
+    # LLM Generation
+    # -------------------------------------------------------------------------
+    response, error = _get_llm_response(messages, use_mcp, trace_id)
+
+    if error:
+        logger.error(f"[{trace_id}] LLM failed: {error}")
+        result["error"] = error
+        return result
+
+    answer = sanitize_answer(response.content) if response else ""
+
+    if use_mcp and response and response.source == 'chat':
+        answer += "\n\n[Note: MCP request failed; response from default chat backend.]"
+
+    result["answer"] = answer
+
+    # Record response in session
+    if session_id:
+        engine.add_response(session_id, answer)
+
+    # -------------------------------------------------------------------------
+    # Phase 4: Feedback logging
+    # -------------------------------------------------------------------------
+    total_time = (time.time() - start_time) * 1000
+
+    result["metrics"] = {
+        "retrieval_time_ms": retrieval_time,
+        "rerank_time_ms": rerank_time,
+        "total_time_ms": total_time,
+        "num_chunks_retrieved": len(ctx_chunks),
+        "diversity_score": diversity_score,
+    }
+
+    if enable_feedback:
+        try:
+            collector = get_feedback_collector()
+            collector.log_retrieval(
+                query_id=query_id,
+                query=question,
+                intent=ctx.intent.value,
+                chunks=ctx_chunks,
+                retrieval_time_ms=retrieval_time,
+                rerank_time_ms=rerank_time,
+                diversity_score=diversity_score
+            )
+            logger.debug(f"[{trace_id}] Logged retrieval metrics")
+        except Exception as e:
+            logger.warning(f"[{trace_id}] Feedback logging failed: {e}")
+
+    logger.info(f"[{trace_id}] Generated answer ({len(answer)} chars) in {total_time:.1f}ms")
+
+    return result
+
+
+def submit_feedback(query_id: str, session_id: str, query: str, response: str,
+                    feedback_type: str, chunk_ids: List[str] = None,
+                    user_id: str = None, score: int = None,
+                    reason: str = None) -> Optional[str]:
+    """
+    Submit user feedback for a query response.
+
+    Args:
+        query_id: The query ID from ask_full_context result
+        session_id: Session ID
+        query: The original query
+        response: The generated response
+        feedback_type: "thumbs_up", "thumbs_down", or "rating"
+        chunk_ids: IDs of chunks used in response
+        user_id: Optional user ID
+        score: Rating score 1-5 (required for "rating" type)
+        reason: Optional reason for negative feedback
+
+    Returns:
+        Feedback ID or None on failure
+    """
+    from ..context_engine import get_feedback_collector
+
+    try:
+        collector = get_feedback_collector()
+
+        if feedback_type == "thumbs_up":
+            return collector.thumbs_up(session_id, query, response, chunk_ids, user_id)
+        elif feedback_type == "thumbs_down":
+            return collector.thumbs_down(session_id, query, response, chunk_ids, user_id, reason)
+        elif feedback_type == "rating" and score is not None:
+            return collector.rating(session_id, query, response, score, chunk_ids, user_id)
+        else:
+            logger.warning(f"Invalid feedback type: {feedback_type}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to submit feedback: {e}")
+        return None
+
+
+def get_analytics(days: int = 30) -> Dict[str, Any]:
+    """
+    Get feedback and retrieval analytics.
+
+    Args:
+        days: Number of days to include in analytics
+
+    Returns:
+        Dict with feedback stats, retrieval stats, and improvement opportunities
+    """
+    from ..context_engine import get_feedback_collector
+
+    try:
+        collector = get_feedback_collector()
+        analytics = collector.get_analytics(days)
+        analytics["improvement_opportunities"] = collector.get_improvement_opportunities(days)
+        return analytics
+    except Exception as e:
+        logger.error(f"Failed to get analytics: {e}")
+        return {"error": str(e)}
