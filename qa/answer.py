@@ -542,3 +542,197 @@ def ask(driver, question: str, top_k: int = 6, use_mcp: bool = False) -> Dict[st
         "citations": citations,
         "used_chunks": ctx_chunks
     }
+
+
+# ============================================================================
+# CONTEXT-AWARE ENTRY POINT
+# ============================================================================
+
+@timed("ask_with_context")
+def ask_with_context(driver, question: str, session_id: Optional[str] = None,
+                     top_k: int = 6, use_mcp: bool = False,
+                     use_llm_context: bool = False) -> Dict[str, Any]:
+    """
+    Answer a question using context-aware retrieval.
+
+    This is an enhanced version of ask() that:
+    - Tracks conversation history via session_id
+    - Classifies query intent
+    - Rewrites queries to resolve coreferences
+    - Adjusts retrieval strategy based on intent
+
+    Args:
+        driver: Neo4j driver
+        question: The question to answer
+        session_id: Optional session ID for conversation tracking
+        top_k: Base number of chunks to retrieve (may be adjusted by intent)
+        use_mcp: Whether to try MCP services
+        use_llm_context: Use LLM for intent/rewriting (slower but better)
+
+    Returns:
+        Dict with 'answer', 'citations', 'used_chunks', 'intent', 'rewritten_query'
+    """
+    from ..context_engine import get_context_engine, Intent
+
+    trace_id = set_trace_id()
+    logger.info(f"[{trace_id}] Processing with context: {question[:50]}...")
+
+    # Get context engine and process query
+    engine = get_context_engine(use_llm=use_llm_context)
+    ctx = engine.process_query(question, session_id)
+
+    logger.info(f"[{trace_id}] Intent: {ctx.intent.value}, entities: {ctx.entities[:3]}")
+
+    if ctx.rewritten_query != question:
+        logger.info(f"[{trace_id}] Rewritten: {ctx.rewritten_query[:50]}...")
+
+    # Use rewritten query for retrieval
+    effective_query = ctx.rewritten_query
+    effective_top_k = ctx.top_k
+
+    # 1) Embed the rewritten question
+    try:
+        q_emb = embed_client.embeddings.create(
+            model=EMBED_MODEL,
+            input=effective_query,
+            encoding_format="float"
+        ).data[0].embedding
+    except Exception as e:
+        logger.error(f"[{trace_id}] Failed to embed question: {e}")
+        return {
+            "answer": "",
+            "citations": [],
+            "used_chunks": [],
+            "intent": ctx.intent.value,
+            "rewritten_query": effective_query,
+            "error": f"Embedding failed: {e}"
+        }
+
+    # 2) Build FTS query
+    fts_q = _fts_query_from_question(effective_query)
+
+    # 3) Anchor on best FTS hit + neighbor window (if enabled)
+    ctx_chunks: List[Dict[str, Any]] = []
+    if ctx.include_neighbors:
+        best = _fts_best_chunk(driver, fts_q)
+        if best:
+            doc_id, ord0 = best
+            ctx_chunks = _neighbor_window(driver, doc_id, ord0, FOCUS_WINDOW)
+            logger.debug(f"[{trace_id}] Anchor: doc={doc_id[:8]}, order={ord0}")
+
+    # 4) Supplement with hybrid search
+    try:
+        hyb = hybrid_search(driver, q_emb, fts_q, top_k=effective_top_k) or []
+    except Exception as e:
+        logger.warning(f"[{trace_id}] Hybrid search failed: {e}")
+        hyb = []
+
+    # Merge results
+    seen = {c["chunk_id"] for c in ctx_chunks}
+    for h in hyb:
+        if h["chunk_id"] not in seen:
+            h.setdefault("heading", None)
+            ctx_chunks.append(h)
+            seen.add(h["chunk_id"])
+
+    logger.info(f"[{trace_id}] Retrieved {len(ctx_chunks)} chunks")
+
+    # 5) Hydrate headings and apply boost
+    _hydrate_headings(driver, ctx_chunks)
+    ctx_chunks = _apply_heading_boost(effective_query, ctx_chunks)
+
+    # 6) Build intent-aware system prompt
+    system_prompt = _get_intent_system_prompt(ctx.intent)
+
+    # 7) Pack context and build prompt
+    context_text, citations = _build_context_block_fit_diverse(ctx_chunks)
+    user_prompt = _get_intent_user_prompt(ctx.intent, question, context_text)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    # 8) Get LLM response
+    response, error = _get_llm_response(messages, use_mcp, trace_id)
+
+    if error:
+        logger.error(f"[{trace_id}] LLM failed: {error}")
+        return {
+            "answer": "",
+            "citations": [],
+            "used_chunks": ctx_chunks,
+            "intent": ctx.intent.value,
+            "rewritten_query": effective_query,
+            "error": error
+        }
+
+    # 9) Clean up answer and record in session
+    answer = sanitize_answer(response.content) if response else ""
+
+    if use_mcp and response and response.source == 'chat':
+        answer += "\n\n[Note: MCP request failed; response from default chat backend.]"
+
+    # Record response in session for future context
+    if session_id:
+        engine.add_response(session_id, answer)
+
+    logger.info(f"[{trace_id}] Generated answer ({len(answer)} chars)")
+
+    return {
+        "answer": answer,
+        "citations": citations,
+        "used_chunks": ctx_chunks,
+        "intent": ctx.intent.value,
+        "rewritten_query": effective_query,
+        "entities": ctx.entities,
+    }
+
+
+def _get_intent_system_prompt(intent) -> str:
+    """Get system prompt tailored to query intent."""
+    from ..context_engine import Intent
+
+    base = (
+        "You are a precise assistant. Use ONLY the provided context to answer.\n"
+        "If the answer is not in the context, say you don't know.\n"
+        "Cite supporting chunk(s) inline like [doc:title#chunk_order].\n"
+    )
+
+    if intent == Intent.HOW_TO:
+        return base + "\nProvide step-by-step instructions when applicable."
+
+    elif intent == Intent.COMPARISON:
+        return base + "\nStructure your answer to clearly compare the items."
+
+    elif intent == Intent.SUMMARIZATION:
+        return base + "\nProvide a concise summary of the key points."
+
+    elif intent == Intent.LIST:
+        return base + "\nFormat your answer as a clear list."
+
+    elif intent == Intent.DEFINITION:
+        return base + "\nProvide a clear, concise definition."
+
+    return base + "\nBe concise and factual."
+
+
+def _get_intent_user_prompt(intent, question: str, context: str) -> str:
+    """Get user prompt tailored to query intent."""
+    from ..context_engine import Intent
+
+    base = f"Question:\n{question}\n\nContext:\n{context}"
+
+    if intent == Intent.HOW_TO:
+        return f"Provide step-by-step instructions for the following question, using the context.\n\n{base}"
+
+    elif intent == Intent.COMPARISON:
+        return f"Compare and contrast the following, using the context.\n\n{base}"
+
+    elif intent == Intent.SUMMARIZATION:
+        return f"Summarize the following based on the context.\n\n{base}"
+
+    elif intent == Intent.LIST:
+        return f"List the items requested, using the context.\n\n{base}"
+
+    return f"Answer the following question using ONLY the context below. Be concise.\n\n{base}"
