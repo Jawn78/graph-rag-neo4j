@@ -1,7 +1,7 @@
 """
 Batched upserts for Documents and Chunks.
 
-- Accepts input rows in either of these shapes:
+Accepts input rows in either of these shapes:
     Docs:
       {"doc_id": str, "title": str, "text": str,
        "meta": "<json string>" }  OR
@@ -16,20 +16,31 @@ Batched upserts for Documents and Chunks.
        "embedding": [float,...],
        "metadata": { ... } }
 
-- For Documents, we also persist top-level properties:
+For Documents, we also persist top-level properties:
     doc.source, doc.path, doc.filename
   (extracted from metadata if present)
+
+Data is expected to be already sanitized from the ingestion pipeline.
+This module performs only minimal validation to catch corruption.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, Iterable, List
 
 from neo4j import Driver
+
 from ..config import NEO4J_DB
+from ..utils.text import sanitize_text, is_corrupted
+from ..utils.logging import get_trace_id
+
+logger = logging.getLogger(__name__)
+
 
 def _to_json(meta: Any) -> str:
+    """Convert metadata to JSON string."""
     if not meta:
         return "{}"
     if isinstance(meta, str):
@@ -39,7 +50,9 @@ def _to_json(meta: Any) -> str:
     except Exception:
         return "{}"
 
+
 def _extract_meta_fields(meta_any: Any) -> Dict[str, str]:
+    """Extract common metadata fields from various input formats."""
     obj: Dict[str, Any] = {}
     if isinstance(meta_any, dict):
         obj = meta_any
@@ -54,22 +67,31 @@ def _extract_meta_fields(meta_any: Any) -> Dict[str, str]:
         "filename": str(obj.get("filename", "") or ""),
     }
 
+
 def _normalize_doc_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Normalize document rows for upsert.
+
+    Performs validation and light sanitization. Data should already be
+    sanitized from ingestion, but we catch any corruption here.
+    """
+    trace_id = get_trace_id()
     out: List[Dict[str, Any]] = []
+
     for d in rows or []:
         meta_any = d.get("meta") if "meta" in d else d.get("metadata", {})
         meta_json = _to_json(meta_any)
         tops = _extract_meta_fields(meta_any)
-        
-        # Sanitize document text
-        title = _sanitize_text(d.get("title", ""))
-        text = _sanitize_text(d.get("text", ""))
-        
-        # Skip documents with corrupted text
-        if not text or _is_corrupted_text(text):
-            print(f"[WARNING] Skipping corrupted document: {d.get('doc_id', 'unknown')[:8]}...")
+
+        # Light sanitization (should already be clean from ingestion)
+        title = sanitize_text(d.get("title", ""), check_corruption=False)
+        text = d.get("text", "") or ""
+
+        # Validation: skip corrupted documents
+        if not text or is_corrupted(text):
+            logger.warning(f"[{trace_id}] Skipping corrupted document: {d.get('doc_id', 'unknown')[:8]}...")
             continue
-            
+
         out.append({
             "doc_id": d["doc_id"],
             "title": title,
@@ -79,74 +101,29 @@ def _normalize_doc_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "path": tops["path"],
             "filename": tops["filename"],
         })
+
     return out
 
-def _sanitize_text(text: str) -> str:
-    """Sanitize text for database storage."""
-    if not text:
-        return ""
-    
-    import re
-    
-    # Remove control characters (except \t, \n, \r)
-    text = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', ' ', text)
-    
-    # Remove problematic Unicode characters
-    text = re.sub(r'[\u200b-\u200d\ufeff]', '', text)  # Zero-width characters
-    text = re.sub(r'[\u2028\u2029]', '\n', text)       # Line/paragraph separators
-    text = re.sub(r'[\u00a0]', ' ', text)              # Non-breaking space
-    
-    # Remove excessive repeated characters
-    text = re.sub(r'(.)\1{10,}', r'\1', text)
-    
-    # Normalize whitespace
-    text = re.sub(r'[ \t]+', ' ', text)
-    text = re.sub(r'\n+', '\n', text)
-    
-    # Ensure proper encoding
-    try:
-        text = text.encode('utf-8', errors='ignore').decode('utf-8')
-    except Exception:
-        pass
-    
-    return text.strip()
-
-def _is_corrupted_text(text: str) -> bool:
-    """Check if text appears to be corrupted."""
-    if not text or len(text) < 10:
-        return False
-    
-    import re
-    
-    # Check for excessive repeated characters
-    if re.search(r'(.)\1{20,}', text):
-        return True
-    
-    # Check for high ratio of non-printable characters
-    printable_chars = sum(1 for c in text if c.isprintable() or c.isspace())
-    if len(text) > 0 and printable_chars / len(text) < 0.7:
-        return True
-    
-    return False
 
 def _normalize_chunk_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Normalize chunk rows for upsert.
+
+    Performs validation. Data should already be sanitized from ingestion.
+    """
+    trace_id = get_trace_id()
     out: List[Dict[str, Any]] = []
+
     for c in rows or []:
         meta_any = c.get("meta") if "meta" in c else c.get("metadata", {})
-        
-        # Sanitize text before storing
-        text = c.get("text", "")
-        heading = c.get("heading", "")
-        
-        # Apply aggressive text cleaning
-        text = _sanitize_text(text)
-        heading = _sanitize_text(heading)
-        
-        # Skip chunks with corrupted or empty text
-        if not text or _is_corrupted_text(text):
-            print(f"[WARNING] Skipping corrupted chunk: {c.get('chunk_id', 'unknown')[:8]}...")
+        text = c.get("text", "") or ""
+        heading = c.get("heading", "") or ""
+
+        # Validation: skip corrupted chunks
+        if not text or is_corrupted(text):
+            logger.warning(f"[{trace_id}] Skipping corrupted chunk: {c.get('chunk_id', 'unknown')[:8]}...")
             continue
-            
+
         out.append({
             "chunk_id": c["chunk_id"],
             "doc_id": c["doc_id"],
@@ -156,13 +133,28 @@ def _normalize_chunk_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]
             "meta_json": _to_json(meta_any),
             "embedding": c.get("embedding"),
         })
+
     return out
 
-def upsert_docs(dr: Driver, rows: Iterable[Dict[str, Any]]) -> None:
+
+def upsert_docs(driver: Driver, rows: Iterable[Dict[str, Any]]) -> int:
+    """
+    Upsert documents to Neo4j.
+
+    Args:
+        driver: Neo4j driver
+        rows: Iterable of document dicts
+
+    Returns:
+        Number of documents upserted
+    """
+    trace_id = get_trace_id()
     norm = _normalize_doc_rows(rows)
+
     if not norm:
-        return
-    with dr.session(database=NEO4J_DB) as s:
+        return 0
+
+    with driver.session(database=NEO4J_DB) as s:
         s.run(
             """
             UNWIND $rows AS d
@@ -184,11 +176,28 @@ def upsert_docs(dr: Driver, rows: Iterable[Dict[str, Any]]) -> None:
             rows=norm,
         )
 
-def upsert_chunks(dr: Driver, rows: Iterable[Dict[str, Any]]) -> None:
+    logger.debug(f"[{trace_id}] Upserted {len(norm)} documents")
+    return len(norm)
+
+
+def upsert_chunks(driver: Driver, rows: Iterable[Dict[str, Any]]) -> int:
+    """
+    Upsert chunks to Neo4j with embeddings.
+
+    Args:
+        driver: Neo4j driver
+        rows: Iterable of chunk dicts
+
+    Returns:
+        Number of chunks upserted
+    """
+    trace_id = get_trace_id()
     norm = _normalize_chunk_rows(rows)
+
     if not norm:
-        return
-    with dr.session(database=NEO4J_DB) as s:
+        return 0
+
+    with driver.session(database=NEO4J_DB) as s:
         s.run(
             """
             UNWIND $rows AS c
@@ -213,3 +222,6 @@ def upsert_chunks(dr: Driver, rows: Iterable[Dict[str, Any]]) -> None:
             """,
             rows=norm,
         )
+
+    logger.debug(f"[{trace_id}] Upserted {len(norm)} chunks")
+    return len(norm)
