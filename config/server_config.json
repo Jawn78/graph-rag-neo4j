@@ -1,6 +1,6 @@
 {
     "chat_server": {
-        "model_path": "D:/models/llama-2-7b-chat.Q4_K_M.gguf",
+        "model_path": "F:/llama-2-7b-chat.Q4_K_M.gguf",
         "host": "127.0.0.1",
         "port": 8081,
         "n_gpu_layers": 32,
@@ -11,7 +11,7 @@
         "verbose": true
     },
     "embedding_server": {
-        "model_path": "F:/Models/Qwen3-Embedding-8B-Q6_K.gguf",
+        "model_path": "F:/Qwen3-Embedding-8B-Q8_0.gguf",
         "host": "127.0.0.1",
         "port": 8080,
         "model_alias": "qwen3-embed-0.6b",

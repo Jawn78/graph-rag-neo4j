@@ -72,13 +72,13 @@ class EnvironmentManager:
 
 def setup_environment(force: bool = False):
     """Quick setup function for environment configuration."""
-    workspace_root = Path(__file__).parent.parent
+    workspace_root = Path(__file__).parent.parent.parent
     env_manager = EnvironmentManager(workspace_root)
     env_manager.setup_environment(force=force)
-    
+
 def verify_environment() -> Dict[str, Any]:
     """Verify the complete environment setup."""
-    workspace_root = Path(__file__).parent.parent
+    workspace_root = Path(__file__).parent.parent.parent
     env_manager = EnvironmentManager(workspace_root)
     
     cuda_status, cuda_info = env_manager.verify_cuda()

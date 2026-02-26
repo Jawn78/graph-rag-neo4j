@@ -23,7 +23,7 @@ class ServerConfig:
 class ServerManager:
     def __init__(self, config_path: Optional[Path] = None):
         if config_path is None:
-            config_path = Path(__file__).parent.parent / "config" / "server_config.json"
+            config_path = Path(__file__).parent.parent.parent / "config" / "server_config.json"
         self.config_path = config_path
         self.servers: Dict[str, subprocess.Popen] = {}
         self._load_config()
