@@ -30,6 +30,9 @@ dev = [
     "pytest>=7.4.0",
     "ruff>=0.4",
 ]
+rerank = [
+    "sentence-transformers>=2.2",
+]
 
 [project.scripts]
 graph-rag = "graph_rag.__main__:cli"

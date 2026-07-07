@@ -138,7 +138,8 @@ def mmr_rerank(query_embedding: List[float],
                chunks: List[Dict[str, Any]],
                driver=None,
                lambda_param: float = MMR_LAMBDA,
-               top_k: int = RERANK_TOP_K) -> List[Dict[str, Any]]:
+               top_k: int = RERANK_TOP_K,
+               relevance_overrides: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
     """
     Maximal Marginal Relevance reranking.
 
@@ -154,6 +155,9 @@ def mmr_rerank(query_embedding: List[float],
         driver: Optional Neo4j driver for embedding lookup
         lambda_param: Balance between relevance (1.0) and diversity (0.0)
         top_k: Number of results to return
+        relevance_overrides: Optional chunk_id -> relevance map (e.g. from a
+            cross-encoder) used instead of embedding cosine for the relevance
+            term; diversity still uses embeddings
 
     Returns:
         Reranked list of chunks with diversity
@@ -174,7 +178,9 @@ def mmr_rerank(query_embedding: List[float],
     relevance_scores: Dict[str, float] = {}
     for chunk, emb in chunk_embeddings:
         cid = chunk["chunk_id"]
-        if emb:
+        if relevance_overrides is not None and cid in relevance_overrides:
+            relevance_scores[cid] = relevance_overrides[cid]
+        elif emb:
             relevance_scores[cid] = _cosine_similarity(query_embedding, emb)
         else:
             relevance_scores[cid] = chunk.get("_score", 0.5)
@@ -220,11 +226,15 @@ def rerank_chunks(query_embedding: List[float],
                   driver=None,
                   use_mmr: bool = MMR_ENABLED,
                   lambda_param: float = MMR_LAMBDA,
-                  top_k: int = RERANK_TOP_K) -> List[Dict[str, Any]]:
+                  top_k: int = RERANK_TOP_K,
+                  query_text: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Main reranking function.
 
-    Applies embedding-based reranking with optional MMR diversity.
+    Relevance comes from a cross-encoder when one is configured
+    (CROSS_ENCODER_MODEL + the 'rerank' extra installed) and query_text is
+    provided; otherwise from embedding cosine similarity. MMR diversity is
+    applied on top in either case.
 
     Args:
         query_embedding: The query embedding vector
@@ -233,6 +243,7 @@ def rerank_chunks(query_embedding: List[float],
         use_mmr: Whether to apply MMR diversity
         lambda_param: MMR lambda (relevance vs diversity)
         top_k: Number of results to return
+        query_text: Raw query text, required for cross-encoder scoring
 
     Returns:
         Reranked list of chunks
@@ -245,8 +256,29 @@ def rerank_chunks(query_embedding: List[float],
 
     logger.debug(f"Reranking {len(chunks)} chunks (MMR={use_mmr}, lambda={lambda_param})")
 
+    # Cross-encoder path: joint (query, chunk) scoring beats re-using the
+    # bi-encoder embeddings the vector index already searched with.
+    ce_relevance: Optional[Dict[str, float]] = None
+    if query_text:
+        from .cross_encoder import cross_encoder_scores
+        scores = cross_encoder_scores(query_text, chunks)
+        if scores is not None:
+            # Min-max normalize so scores compose with MMR's [0,1] cosine terms
+            lo, hi = min(scores), max(scores)
+            spread = (hi - lo) or 1.0
+            ce_relevance = {}
+            for chunk, s in zip(chunks, scores):
+                norm = (s - lo) / spread
+                ce_relevance[chunk["chunk_id"]] = norm
+                chunk["_ce_score"] = float(s)
+            logger.debug("Using cross-encoder relevance for rerank")
+
     if use_mmr:
-        result = mmr_rerank(query_embedding, chunks, driver, lambda_param, top_k)
+        result = mmr_rerank(query_embedding, chunks, driver, lambda_param, top_k,
+                            relevance_overrides=ce_relevance)
+    elif ce_relevance is not None:
+        ordered = sorted(chunks, key=lambda c: ce_relevance[c["chunk_id"]], reverse=True)
+        result = ordered[:top_k]
     else:
         result = rerank_by_embedding(query_embedding, chunks, driver, top_k)
 

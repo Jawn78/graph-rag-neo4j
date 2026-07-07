@@ -74,9 +74,26 @@ _FACTUAL_KEYWORDS = [
 _FACTUAL_PATTERNS = [re.compile(p, re.IGNORECASE) for p in _FACTUAL_KEYWORDS]
 
 
+# When several intents' patterns fire (e.g. "What is X?" is both DEFINITION
+# and FACTUAL-shaped), prefer the more specific intent. Order matters.
+_INTENT_SPECIFICITY = [
+    Intent.COMPARISON,
+    Intent.HOW_TO,
+    Intent.SUMMARIZATION,
+    Intent.LIST,
+    Intent.CLARIFICATION,
+    Intent.DEFINITION,
+    Intent.EXPLORATORY,
+]
+
+
 def classify_intent_rules(query: str) -> Tuple[Intent, float]:
     """
     Classify intent using rule-based patterns.
+
+    Scores ALL intents rather than returning on the first pattern hit, so
+    overlapping patterns don't get resolved by dict iteration order. Ties are
+    broken by specificity (comparison beats factual, etc.).
 
     Returns (intent, confidence) tuple.
     """
@@ -84,11 +101,21 @@ def classify_intent_rules(query: str) -> Tuple[Intent, float]:
     if not query:
         return Intent.UNKNOWN, 0.0
 
-    # Check each intent's patterns
-    for intent, patterns in _INTENT_PATTERNS.items():
-        for pattern in patterns:
-            if pattern.search(query):
-                return intent, 0.85  # High confidence for pattern match
+    # Count pattern hits per intent
+    hits = {
+        intent: sum(1 for pattern in patterns if pattern.search(query))
+        for intent, patterns in _INTENT_PATTERNS.items()
+    }
+    matched = {intent: n for intent, n in hits.items() if n > 0}
+
+    if matched:
+        best = max(
+            matched,
+            key=lambda i: (matched[i], -_INTENT_SPECIFICITY.index(i)),
+        )
+        # More corroborating patterns -> higher confidence, capped at 0.95
+        confidence = min(0.95, 0.8 + 0.05 * matched[best])
+        return best, confidence
 
     # Check for factual patterns (most common fallback)
     for pattern in _FACTUAL_PATTERNS:

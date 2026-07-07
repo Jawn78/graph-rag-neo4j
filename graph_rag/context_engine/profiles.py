@@ -13,6 +13,8 @@ import json
 import logging
 import hashlib
 from datetime import datetime
+
+from .types import utcnow
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field, asdict
 
@@ -73,8 +75,8 @@ class UserProfile:
     Used for personalized retrieval and result boosting.
     """
     user_id: str
-    created_at: datetime = field(default_factory=datetime.now)
-    last_active: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=utcnow)
+    last_active: datetime = field(default_factory=utcnow)
     preferences: UserPreferences = field(default_factory=UserPreferences)
     query_history: List[QueryHistoryEntry] = field(default_factory=list)
     topic_frequencies: Dict[str, int] = field(default_factory=dict)
@@ -89,7 +91,7 @@ class UserProfile:
         """Record a query in history."""
         entry = QueryHistoryEntry(
             query=query,
-            timestamp=datetime.now(),
+            timestamp=utcnow(),
             intent=intent,
             topics=topics or [],
             entities=entities or []
@@ -106,7 +108,7 @@ class UserProfile:
         for entity in (entities or []):
             self.entity_frequencies[entity] = self.entity_frequencies.get(entity, 0) + 1
 
-        self.last_active = datetime.now()
+        self.last_active = utcnow()
 
     def add_feedback(self, query: str, score: float,
                      clicked_results: List[str] = None) -> None:
@@ -208,7 +210,7 @@ class InMemoryProfileStore(ProfileStore):
         profile = self._profiles.get(user_id)
         if profile:
             # Check TTL
-            age = datetime.now() - profile.last_active
+            age = utcnow() - profile.last_active
             if age.days > PROFILE_TTL_DAYS:
                 del self._profiles[user_id]
                 return None
@@ -248,7 +250,7 @@ class FileProfileStore(ProfileStore):
             profile = UserProfile.from_dict(data)
 
             # Check TTL
-            age = datetime.now() - profile.last_active
+            age = utcnow() - profile.last_active
             if age.days > PROFILE_TTL_DAYS:
                 os.remove(path)
                 return None

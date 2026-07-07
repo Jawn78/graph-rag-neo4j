@@ -48,7 +48,8 @@ Usage:
 from .types import Intent, SessionContext, QueryContext, ConversationTurn
 from .session import SessionManager, get_session_manager
 from .intent import classify_intent, get_intent_hints
-from .query_rewriter import rewrite_query
+from .query_rewriter import rewrite_query, detect_followup, detect_reformulation
+from .corpus_entities import match_corpus_entities, get_corpus_dictionary
 from .engine import ContextEngine, get_context_engine, process_query
 
 # Phase 2: Reranking and Filtering
@@ -95,6 +96,10 @@ __all__ = [
 
     # Query rewriting
     'rewrite_query',
+    'detect_followup',
+    'detect_reformulation',
+    'match_corpus_entities',
+    'get_corpus_dictionary',
 
     # Main engine
     'ContextEngine',

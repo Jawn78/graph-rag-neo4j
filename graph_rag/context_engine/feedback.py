@@ -14,6 +14,8 @@ import logging
 import sqlite3
 import threading
 from datetime import datetime, timedelta
+
+from .types import utcnow
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -49,7 +51,7 @@ class FeedbackEntry:
     feedback_type: FeedbackType
     value: float  # Normalized 0-1 for all types
     chunk_ids: List[str] = field(default_factory=list)
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=utcnow)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -86,7 +88,7 @@ class RetrievalMetrics:
     diversity_score: float = 0.0
     avg_chunk_score: float = 0.0
     chunk_ids: List[str] = field(default_factory=list)
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=utcnow)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -228,7 +230,7 @@ class FeedbackStore:
 
     def get_feedback_stats(self, days: int = ANALYTICS_WINDOW_DAYS) -> Dict[str, Any]:
         """Get aggregated feedback statistics."""
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        cutoff = (utcnow() - timedelta(days=days)).isoformat()
 
         with self._cursor() as cur:
             # Overall stats
@@ -265,7 +267,7 @@ class FeedbackStore:
 
     def get_retrieval_stats(self, days: int = ANALYTICS_WINDOW_DAYS) -> Dict[str, Any]:
         """Get aggregated retrieval metrics."""
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        cutoff = (utcnow() - timedelta(days=days)).isoformat()
 
         with self._cursor() as cur:
             cur.execute("""
@@ -296,7 +298,7 @@ class FeedbackStore:
 
     def get_intent_breakdown(self, days: int = ANALYTICS_WINDOW_DAYS) -> Dict[str, int]:
         """Get query counts by intent."""
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        cutoff = (utcnow() - timedelta(days=days)).isoformat()
 
         with self._cursor() as cur:
             cur.execute("""
@@ -312,7 +314,7 @@ class FeedbackStore:
     def get_low_satisfaction_queries(self, days: int = ANALYTICS_WINDOW_DAYS,
                                       limit: int = 20) -> List[Dict[str, Any]]:
         """Get queries with low satisfaction for analysis."""
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        cutoff = (utcnow() - timedelta(days=days)).isoformat()
 
         with self._cursor() as cur:
             cur.execute("""
@@ -331,7 +333,7 @@ class FeedbackStore:
     def get_chunk_performance(self, days: int = ANALYTICS_WINDOW_DAYS,
                                limit: int = 50) -> List[Dict[str, Any]]:
         """Get chunk performance based on feedback."""
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        cutoff = (utcnow() - timedelta(days=days)).isoformat()
 
         # This requires parsing chunk_ids JSON - simplified version
         with self._cursor() as cur:

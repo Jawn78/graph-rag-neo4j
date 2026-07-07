@@ -99,6 +99,15 @@ HEADING_BOOST_CAP = float(os.getenv("HEADING_BOOST_CAP", "0.45"))
 # Bonus for bigram phrase matches: 0.30 rewards phrase matches
 HEADING_PHRASE_BONUS = float(os.getenv("HEADING_PHRASE_BONUS", "0.30"))
 
+# Boost for chunks from documents cited in the previous answer (follow-ups).
+# Applied in the same score space as the heading boost.
+ANCHOR_DOC_BOOST = float(os.getenv("ANCHOR_DOC_BOOST", "0.20"))
+
+# Follow-up embedding blend: weight of the CURRENT query's embedding when a
+# follow-up is detected; the remainder comes from the previous query's
+# embedding. Rescues retrieval when the textual rewrite misses the referent.
+FOLLOWUP_EMB_WEIGHT = float(os.getenv("FOLLOWUP_EMB_WEIGHT", "0.75"))
+
 
 # ============================================================================
 # RESPONSE TYPES
@@ -315,12 +324,18 @@ def _hydrate_headings(driver, chunks: List[Dict[str, Any]]) -> None:
             c["heading"] = h
 
 
-def _apply_heading_boost(question: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Re-rank chunks by heading relevance to question."""
+def _apply_heading_boost(question: str, chunks: List[Dict[str, Any]],
+                         anchor_doc_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """
+    Re-rank chunks by heading relevance to the question, plus an anchor boost
+    for chunks from documents cited in the previous answer (follow-ups tend
+    to be about the document the user was just reading).
+    """
     qwords = set(_q_tokens(question))
     phrases = [p.lower() for p in _extract_phrases(question)]
+    anchors = set(anchor_doc_ids or [])
 
-    if not qwords and not phrases:
+    if not qwords and not phrases and not anchors:
         return chunks
 
     # Ensure all chunks have heading field
@@ -337,10 +352,30 @@ def _apply_heading_boost(question: str, chunks: List[Dict[str, Any]]) -> List[Di
         if boost < HEADING_BOOST_CAP and any(p in h for p in phrases):
             boost = min(HEADING_BOOST_CAP, boost + HEADING_PHRASE_BONUS)
 
+        if anchors and c.get("doc_id") in anchors:
+            boost += ANCHOR_DOC_BOOST
+
         scored.append((boost, idx, c))
 
     scored.sort(key=lambda x: (-x[0], x[1]))
     return [c for _, _, c in scored]
+
+
+def _blend_followup_embedding(q_emb: List[float], ctx) -> List[float]:
+    """
+    For follow-up queries, blend the current query embedding with the
+    previous query's embedding stored on the session. Cosine similarity is
+    scale-invariant, so no renormalization is needed.
+    """
+    if not ctx.is_followup or ctx.session is None:
+        return q_emb
+
+    prev = ctx.session.metadata.get("last_q_emb")
+    if not prev or len(prev) != len(q_emb):
+        return q_emb
+
+    w = FOLLOWUP_EMB_WEIGHT
+    return [w * a + (1.0 - w) * b for a, b in zip(q_emb, prev)]
 
 
 # ============================================================================
@@ -437,12 +472,17 @@ def _embed_query(text: str, trace_id: str) -> Optional[List[float]]:
 def _retrieve_chunks(driver, query: str, q_emb: List[float], top_k: int,
                      include_neighbors: bool = True,
                      fetch_multiplier: int = 1,
-                     trace_id: str = "") -> List[Dict[str, Any]]:
+                     trace_id: str = "",
+                     fts_text: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Shared retrieval step: FTS anchor + neighbor window, supplemented with
     hybrid (vector + keyword) search, deduplicated by chunk_id.
+
+    fts_text, when given, overrides the text used for the keyword (FTS) leg —
+    used to apply entity expansion to lexical search only, without distorting
+    the dense embedding of the query itself.
     """
-    fts_q = _fts_query_from_question(query)
+    fts_q = _fts_query_from_question(fts_text or query)
     logger.debug(f"[{trace_id}] FTS query: {fts_q}")
 
     ctx_chunks: List[Dict[str, Any]] = []
@@ -602,15 +642,18 @@ def ask_with_context(driver, question: str, session_id: Optional[str] = None,
             "error": "Embedding failed"
         }
 
-    # 2) Retrieve (FTS anchor + hybrid search)
+    # 2) Retrieve (FTS anchor + hybrid search); follow-ups blend in the
+    # previous query's embedding and boost previously cited documents
+    retrieval_emb = _blend_followup_embedding(q_emb, ctx)
     ctx_chunks = _retrieve_chunks(
-        driver, effective_query, q_emb, effective_top_k,
+        driver, effective_query, retrieval_emb, effective_top_k,
         include_neighbors=ctx.include_neighbors, trace_id=trace_id
     )
 
-    # 3) Hydrate headings and apply boost
+    # 3) Hydrate headings and apply boosts
     _hydrate_headings(driver, ctx_chunks)
-    ctx_chunks = _apply_heading_boost(effective_query, ctx_chunks)
+    ctx_chunks = _apply_heading_boost(effective_query, ctx_chunks,
+                                      anchor_doc_ids=ctx.anchor_doc_ids)
 
     # 4) Build intent-aware prompt
     system_prompt = _get_intent_system_prompt(ctx.intent)
@@ -639,9 +682,10 @@ def ask_with_context(driver, question: str, session_id: Optional[str] = None,
     # 6) Clean up answer and record in session
     answer = _finalize_answer(response, use_mcp)
 
-    # Record response in session for future context
+    # Record response + retrieval context in session for future follow-ups
     if session_id:
-        engine.add_response(session_id, answer)
+        engine.add_response(session_id, answer,
+                            used_chunks=ctx_chunks, query_embedding=q_emb)
 
     logger.info(f"[{trace_id}] Generated answer ({len(answer)} chars)")
 
@@ -752,6 +796,7 @@ def ask_full_context(driver, question: str, session_id: Optional[str] = None,
         ProfileManager, apply_personalization, get_profile_context,
         get_feedback_collector
     )
+    from ..context_engine.corpus_entities import match_corpus_entities
 
     trace_id = set_trace_id()
     query_id = str(uuid.uuid4())
@@ -781,19 +826,34 @@ def ask_full_context(driver, question: str, session_id: Optional[str] = None,
     result["intent"] = ctx.intent.value
     result["rewritten_query"] = ctx.rewritten_query
     result["entities"] = ctx.entities
+    result["is_followup"] = ctx.is_followup
 
     logger.info(f"[{trace_id}] Intent: {ctx.intent.value}, entities: {ctx.entities[:3]}")
 
     # Extract entities from query for expansion
     query_entities = extract_entities(question)
     entity_strings = [e.text for e in query_entities]
-    result["entities"] = list(set(result["entities"] + entity_strings))
 
-    # Expand query with entity terms
+    # Corpus-derived entities: case-insensitive match against document titles
+    # and headings actually present in the graph ("hipaa" matches even though
+    # generic NER needs capitalization)
+    corpus_entities = match_corpus_entities(driver, ctx.rewritten_query)
+    if corpus_entities:
+        logger.debug(f"[{trace_id}] Corpus entities: {corpus_entities}")
+
+    result["entities"] = list(set(result["entities"] + entity_strings + corpus_entities))
+
+    # Entity expansion strengthens the KEYWORD leg only. The dense embedding
+    # uses the unexpanded query — appending terms distorts it.
     effective_query = ctx.rewritten_query
+    fts_query_text = effective_query
     if query_entities:
-        effective_query = expand_query_with_entities(effective_query, query_entities)
-        logger.debug(f"[{trace_id}] Entity-expanded query: {effective_query[:80]}...")
+        fts_query_text = expand_query_with_entities(fts_query_text, query_entities)
+    for ce in corpus_entities:
+        if ce.lower() not in fts_query_text.lower():
+            fts_query_text = f"{fts_query_text} {ce}"
+    if fts_query_text != effective_query:
+        logger.debug(f"[{trace_id}] Entity-expanded FTS text: {fts_query_text[:80]}...")
 
     effective_top_k = ctx.top_k
 
@@ -827,15 +887,18 @@ def ask_full_context(driver, question: str, session_id: Optional[str] = None,
         return result
 
     # -------------------------------------------------------------------------
-    # Retrieval - fetch extra candidates when reranking will trim them
+    # Retrieval - fetch extra candidates when reranking will trim them.
+    # Follow-ups blend in the previous query's embedding.
     # -------------------------------------------------------------------------
     retrieval_start = time.time()
 
+    retrieval_emb = _blend_followup_embedding(q_emb, ctx)
     ctx_chunks = _retrieve_chunks(
-        driver, effective_query, q_emb, effective_top_k,
+        driver, effective_query, retrieval_emb, effective_top_k,
         include_neighbors=ctx.include_neighbors,
         fetch_multiplier=3 if enable_rerank else 1,
-        trace_id=trace_id
+        trace_id=trace_id,
+        fts_text=fts_query_text
     )
 
     retrieval_time = (time.time() - retrieval_start) * 1000
@@ -890,7 +953,8 @@ def ask_full_context(driver, question: str, session_id: Optional[str] = None,
             q_emb, ctx_chunks, driver,
             use_mmr=enable_mmr,
             lambda_param=mmr_lambda,
-            top_k=effective_top_k
+            top_k=effective_top_k,
+            query_text=effective_query  # enables cross-encoder when configured
         )
 
         rerank_time = (time.time() - rerank_start) * 1000
@@ -918,7 +982,8 @@ def ask_full_context(driver, question: str, session_id: Optional[str] = None,
     # Heading boost and context building
     # -------------------------------------------------------------------------
     _hydrate_headings(driver, ctx_chunks)
-    ctx_chunks = _apply_heading_boost(effective_query, ctx_chunks)
+    ctx_chunks = _apply_heading_boost(effective_query, ctx_chunks,
+                                      anchor_doc_ids=ctx.anchor_doc_ids)
 
     context_text, citations = _build_context_block_fit_diverse(ctx_chunks)
     result["citations"] = citations
@@ -951,9 +1016,10 @@ def ask_full_context(driver, question: str, session_id: Optional[str] = None,
     answer = _finalize_answer(response, use_mcp)
     result["answer"] = answer
 
-    # Record response in session
+    # Record response + retrieval context in session for future follow-ups
     if session_id:
-        engine.add_response(session_id, answer)
+        engine.add_response(session_id, answer,
+                            used_chunks=ctx_chunks, query_embedding=q_emb)
 
     # -------------------------------------------------------------------------
     # Phase 4: Feedback logging

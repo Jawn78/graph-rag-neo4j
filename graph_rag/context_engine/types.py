@@ -6,9 +6,14 @@ the query understanding and retrieval pipeline.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+
+def utcnow() -> datetime:
+    """Timezone-aware current time. All session/feedback timestamps use UTC."""
+    return datetime.now(timezone.utc)
 
 
 class Intent(Enum):
@@ -35,7 +40,7 @@ class ConversationTurn:
     """
     role: str  # 'user' or 'assistant'
     content: str
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=utcnow)
     intent: Optional[Intent] = None
     entities: List[str] = field(default_factory=list)
 
@@ -60,8 +65,8 @@ class SessionContext:
     turns: List[ConversationTurn] = field(default_factory=list)
     entities: Dict[str, str] = field(default_factory=dict)  # entity -> canonical form
     topic_stack: List[str] = field(default_factory=list)    # current discussion topics
-    created_at: datetime = field(default_factory=datetime.now)
-    last_active: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=utcnow)
+    last_active: datetime = field(default_factory=utcnow)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def add_turn(self, role: str, content: str, intent: Optional[Intent] = None,
@@ -74,7 +79,7 @@ class SessionContext:
             entities=entities or []
         )
         self.turns.append(turn)
-        self.last_active = datetime.now()
+        self.last_active = utcnow()
 
         # Update entity map
         for entity in (entities or []):
@@ -106,6 +111,10 @@ class SessionContext:
     def get_current_topic(self) -> Optional[str]:
         """Get the current discussion topic."""
         return self.topic_stack[-1] if self.topic_stack else None
+
+    def clear_topics(self) -> None:
+        """Clear the topic stack (called when a topic shift is detected)."""
+        self.topic_stack = []
 
     def push_topic(self, topic: str) -> None:
         """Push a new topic onto the stack."""
@@ -140,6 +149,10 @@ class QueryContext:
     entities: List[str]
     session: Optional[SessionContext]
 
+    # Follow-up context
+    is_followup: bool = False             # Query refers back to the conversation
+    anchor_doc_ids: List[str] = field(default_factory=list)  # Docs cited in the previous answer
+
     # Retrieval hints
     require_recency: bool = False        # Weight recent documents higher
     require_comparison: bool = False      # Need multiple perspectives
@@ -157,6 +170,8 @@ class QueryContext:
             "rewritten_query": self.rewritten_query,
             "intent": self.intent.value,
             "entities": self.entities,
+            "is_followup": self.is_followup,
+            "anchor_doc_ids": self.anchor_doc_ids,
             "require_recency": self.require_recency,
             "require_comparison": self.require_comparison,
             "require_procedure": self.require_procedure,

@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 from abc import ABC, abstractmethod
 
-from .types import SessionContext, ConversationTurn, Intent
+from .types import SessionContext, ConversationTurn, Intent, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,15 @@ SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "60"))
 
 # Maximum turns to keep in session history
 MAX_SESSION_TURNS = int(os.getenv("MAX_SESSION_TURNS", "20"))
+
+# Summarize turns that fall out of the window into session.metadata["summary"]
+# so long conversations keep their earlier context. Costs one LLM call per
+# trim; disabled by default.
+SESSION_SUMMARY_ENABLED = os.getenv("SESSION_SUMMARY_ENABLED", "0") == "1"
+
+# Run expired-session cleanup every N saves (the in-memory store leaks
+# otherwise: get() only reaps the specific session being fetched)
+CLEANUP_EVERY_N_SAVES = int(os.getenv("SESSION_CLEANUP_EVERY_N_SAVES", "50"))
 
 
 class SessionStore(ABC):
@@ -68,7 +77,7 @@ class InMemorySessionStore(SessionStore):
                 return None
 
             # Check expiration
-            if datetime.now() - session.last_active > self._ttl:
+            if utcnow() - session.last_active > self._ttl:
                 del self._sessions[session_id]
                 logger.debug(f"Session {session_id} expired")
                 return None
@@ -88,7 +97,7 @@ class InMemorySessionStore(SessionStore):
             self._sessions.pop(session_id, None)
 
     def cleanup_expired(self) -> int:
-        now = datetime.now()
+        now = utcnow()
         expired = []
 
         with self._lock:
@@ -207,6 +216,7 @@ class SessionManager:
     """
 
     def __init__(self, store: Optional[SessionStore] = None):
+        self._save_count = 0
         if store is not None:
             self._store = store
         elif os.getenv("REDIS_URL"):
@@ -236,8 +246,55 @@ class SessionManager:
 
     def save(self, session: SessionContext) -> None:
         """Save session state."""
-        session.last_active = datetime.now()
+        session.last_active = utcnow()
+
+        # Fold turns that are about to fall out of the window into a rolling
+        # summary so long conversations keep their earlier context.
+        if SESSION_SUMMARY_ENABLED and len(session.turns) > MAX_SESSION_TURNS:
+            self._summarize_dropped_turns(session)
+
         self._store.set(session)
+
+        # Opportunistic reaping of expired sessions
+        self._save_count += 1
+        if CLEANUP_EVERY_N_SAVES > 0 and self._save_count % CLEANUP_EVERY_N_SAVES == 0:
+            self.cleanup()
+
+    def _summarize_dropped_turns(self, session: SessionContext) -> None:
+        """Summarize the turns that will be trimmed into metadata['summary'].
+
+        Best-effort: on any failure the turns are simply dropped as before.
+        """
+        dropped = session.turns[:-MAX_SESSION_TURNS]
+        if not dropped:
+            return
+
+        try:
+            from ..config import chat_client, CHAT_MODEL
+
+            convo = "\n".join(
+                f"{'User' if t.role == 'user' else 'Assistant'}: {t.content[:300]}"
+                for t in dropped
+            )
+            prior = session.metadata.get("summary", "")
+            prompt = (
+                "Summarize the following conversation fragment in 2-3 sentences, "
+                "keeping named entities and topics. "
+                + (f"Fold in this earlier summary: {prior}\n\n" if prior else "\n")
+                + convo
+            )
+            resp = chat_client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=150,
+            )
+            summary = (resp.choices[0].message.content or "").strip()
+            if summary:
+                session.metadata["summary"] = summary[:1000]
+                logger.debug(f"Rolled {len(dropped)} turns into session summary")
+        except Exception as e:
+            logger.debug(f"Session summarization failed (turns dropped): {e}")
 
     def delete(self, session_id: str) -> None:
         """Delete a session."""

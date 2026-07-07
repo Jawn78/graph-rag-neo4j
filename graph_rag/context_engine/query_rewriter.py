@@ -8,12 +8,16 @@ Handles:
 """
 
 import re
+import json
 import logging
 from typing import List, Optional, Tuple
 
-from .types import SessionContext, Intent
+from .types import SessionContext
 
 logger = logging.getLogger(__name__)
+
+# A query this short is unlikely to stand on its own in a conversation
+FOLLOWUP_MAX_WORDS = 6
 
 # Pronouns and references that need resolution
 _COREFERENCE_PATTERNS = [
@@ -54,6 +58,62 @@ def _has_coreference(query: str) -> bool:
         if pattern.search(query):
             return True
     return False
+
+
+def _content_tokens(text: str) -> set:
+    """Lowercase alphanumeric tokens of 3+ chars, for overlap heuristics."""
+    return {t for t in re.findall(r"[a-z0-9]{3,}", (text or "").lower())}
+
+
+def detect_followup(query: str, session: Optional[SessionContext]) -> bool:
+    """
+    Decide whether a query is a follow-up to the conversation rather than a
+    self-contained question.
+
+    Signals (any one suffices, given prior turns exist):
+    - contains an unresolved reference (it/that/they/the above ...)
+    - very short query (unlikely to stand alone)
+    - shares no content words with anything -> relies on context implicitly
+      is NOT used; instead we require an explicit signal to avoid false
+      positives on genuinely new short questions with entities of their own.
+    """
+    if session is None or not session.turns:
+        return False
+
+    if _has_coreference(query):
+        return True
+
+    words = query.split()
+    if len(words) <= FOLLOWUP_MAX_WORDS and not _extract_entities_simple(query):
+        return True
+
+    return False
+
+
+def detect_reformulation(query: str, session: Optional[SessionContext],
+                         min_overlap: float = 0.6) -> Optional[str]:
+    """
+    Detect whether this query is a reformulation of the previous user query
+    (an implicit signal that the previous answer missed the mark).
+
+    Returns the previous query if it is a reformulation, else None.
+    """
+    if session is None:
+        return None
+
+    prev = session.get_last_user_query()
+    if not prev or prev.strip().lower() == query.strip().lower():
+        return None
+
+    cur_toks = _content_tokens(query)
+    prev_toks = _content_tokens(prev)
+    if not cur_toks or not prev_toks:
+        return None
+
+    # Overlap coefficient (not Jaccard): reformulations often change word
+    # forms and add qualifiers, which Jaccard punishes too hard.
+    overlap = len(cur_toks & prev_toks) / min(len(cur_toks), len(prev_toks))
+    return prev if overlap >= min_overlap else None
 
 
 def _expand_abbreviations(query: str) -> str:
@@ -150,62 +210,104 @@ def rewrite_query_simple(query: str, session: Optional[SessionContext]) -> Tuple
     return query, unique_entities[:10]
 
 
+def _parse_rewrite_response(raw: str, original_query: str) -> Tuple[str, List[str]]:
+    """
+    Parse the LLM rewrite response (expected JSON) defensively.
+
+    A mangled rewrite is worse than none, so any parse/validation failure
+    returns the original query untouched.
+    """
+    text = (raw or "").strip()
+
+    # Strip markdown code fences if the model added them
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text).strip()
+
+    # Grab the first JSON object in the output
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return original_query, []
+
+    try:
+        obj = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return original_query, []
+
+    rewritten = obj.get("query")
+    entities = obj.get("entities") or []
+
+    if not isinstance(rewritten, str) or not rewritten.strip():
+        rewritten = original_query
+    # Reject runaway rewrites (model rambling instead of rewriting)
+    elif len(rewritten) > max(200, 4 * len(original_query)):
+        rewritten = original_query
+
+    if not isinstance(entities, list):
+        entities = []
+    entities = [str(e).strip() for e in entities if str(e).strip()][:10]
+
+    return rewritten.strip(), entities
+
+
+_REWRITE_SYSTEM_PROMPT = """You rewrite search queries to be self-contained.
+
+Rules:
+1. Resolve pronouns/references (it, this, that, they) using the conversation.
+2. Expand abbreviations.
+3. Keep the rewrite concise; do not answer the question.
+4. If no rewriting is needed, return the query unchanged.
+
+Respond with ONLY a JSON object: {"query": "<rewritten query>", "entities": ["<entity>", ...]}
+
+Examples:
+Conversation:
+User: What does the dental plan cover?
+Query: does it cover implants
+{"query": "does the dental plan cover implants", "entities": ["dental plan", "implants"]}
+
+Conversation:
+User: Summarize Form DD-214.
+Query: how do I request a copy
+{"query": "how do I request a copy of Form DD-214", "entities": ["Form DD-214"]}"""
+
+
 def rewrite_query_llm(query: str, session: Optional[SessionContext]) -> Tuple[str, List[str]]:
     """
-    LLM-based query rewriting.
+    LLM-based query rewriting with JSON output and safe fallback.
 
-    Uses the chat model to:
-    - Resolve coreferences using conversation context
-    - Expand the query for better retrieval
-    - Extract key entities
+    Resolves coreferences using conversation context and extracts entities.
+    Falls back to rule-based rewriting on any failure.
     """
     from ..config import chat_client, CHAT_MODEL
 
     conversation_context = ""
     if session:
         conversation_context = session.get_conversation_text(5)
+        summary = session.metadata.get("summary")
+        if summary:
+            conversation_context = f"(Earlier: {summary})\n{conversation_context}"
 
-    system_prompt = """You are a query rewriter for a search system. Your job is to:
-
-1. Resolve any pronouns or references (it, this, that, they) using conversation context
-2. Expand abbreviations
-3. Make the query self-contained (understandable without conversation history)
-4. Keep the query concise but complete
-
-Respond in this exact format:
-QUERY: <rewritten query>
-ENTITIES: <comma-separated list of key entities>
-
-If no rewriting is needed, return the original query unchanged."""
-
-    user_prompt = f"Original query: {query}"
+    user_prompt = f"Query: {query}"
     if conversation_context:
-        user_prompt = f"Conversation history:\n{conversation_context}\n\n{user_prompt}"
+        user_prompt = f"Conversation:\n{conversation_context}\n\n{user_prompt}"
 
     try:
         response = chat_client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": _REWRITE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.0,
             max_tokens=200
         )
 
-        result = response.choices[0].message.content.strip()
+        raw = response.choices[0].message.content or ""
+        rewritten, entities = _parse_rewrite_response(raw, query)
 
-        # Parse response
-        rewritten = query
-        entities = []
-
-        for line in result.split("\n"):
-            if line.startswith("QUERY:"):
-                rewritten = line[6:].strip()
-            elif line.startswith("ENTITIES:"):
-                entity_str = line[9:].strip()
-                if entity_str and entity_str.lower() != "none":
-                    entities = [e.strip() for e in entity_str.split(",") if e.strip()]
+        if rewritten == query and not entities:
+            # Model produced nothing usable; rules may still resolve something
+            return rewrite_query_simple(query, session)
 
         logger.debug(f"LLM rewrite: '{query[:30]}...' -> '{rewritten[:30]}...'")
         return rewritten, entities
@@ -229,8 +331,10 @@ def rewrite_query(query: str, session: Optional[SessionContext] = None,
     Returns:
         (rewritten_query, extracted_entities) tuple
     """
-    # Quick check: if no coreferences and short query, skip rewriting
-    if not _has_coreference(query) and len(query.split()) < 10:
+    # Fast path: self-contained queries need no LLM and no coreference work.
+    # The LLM (when enabled) is reserved for genuine follow-ups, where it
+    # actually earns its latency.
+    if not _has_coreference(query) and not detect_followup(query, session):
         entities = _extract_entities_simple(query)
         expanded = _expand_abbreviations(query)
         return expanded, entities
@@ -239,32 +343,3 @@ def rewrite_query(query: str, session: Optional[SessionContext] = None,
         return rewrite_query_llm(query, session)
     else:
         return rewrite_query_simple(query, session)
-
-
-def build_search_query(rewritten: str, entities: List[str], intent: Intent) -> str:
-    """
-    Build an optimized search query based on rewritten query and intent.
-
-    Combines the rewritten query with extracted entities for hybrid search.
-    """
-    parts = [rewritten]
-
-    # Add entities as additional search terms
-    for entity in entities[:3]:  # Top 3 entities
-        if entity.lower() not in rewritten.lower():
-            parts.append(entity)
-
-    # Intent-specific modifications
-    if intent == Intent.HOW_TO:
-        # Add procedural keywords
-        parts.extend(["steps", "procedure", "process"])
-
-    elif intent == Intent.COMPARISON:
-        # Add comparison keywords
-        parts.extend(["difference", "comparison", "versus"])
-
-    elif intent == Intent.DEFINITION:
-        # Add definition keywords
-        parts.extend(["definition", "meaning", "overview"])
-
-    return " ".join(parts)
