@@ -12,9 +12,9 @@ A Graph-based Retrieval Augmented Generation (RAG) system with Neo4j backend and
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+
 - CUDA-capable GPU (recommended)
-- Neo4j database
+- Neo4j 5.x database
 - PowerShell (for Windows users)
 
 ## Installation
@@ -26,7 +26,15 @@ python -m venv .venv
 .\.venv\Scripts\activate
 ```
 
-3. Initialize the environment:
+3. Install the package (with document-parsing extras):
+```powershell
+pip install -e ".[ingest]"
+```
+
+4. Configure credentials — copy `.env.example` to `.env` and set at least
+   `NEO4J_PASS` (there is deliberately no default password).
+
+5. Initialize the environment:
 ```powershell
 python -m graph_rag setup init
 ```
@@ -66,3 +74,17 @@ python -m graph_rag check
 - `setup start`: Start server components
 - `setup verify`: Check dependencies
 - `help`: Show command documentation
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+ruff check graph_rag tests   # lint
+pytest tests/ -q             # unit tests
+```
+
+Project layout: everything lives in the `graph_rag` package — `ingest/`
+(parsing, chunking, embedding), `graph/` (Neo4j schema, upserts, hybrid
+search), `qa/` (answer pipeline), `context_engine/` (intent, rewriting,
+reranking, personalization, feedback), `setup/` (environment and llama.cpp
+server management).

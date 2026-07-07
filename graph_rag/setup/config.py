@@ -1,23 +1,10 @@
 from pathlib import Path
 import json
 from typing import Dict, Any, Optional
-import os
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-# Neo4j configuration
-NEO4J_HOST = os.getenv("NEO4J_HOST", "localhost")
-NEO4J_PORT = int(os.getenv("NEO4J_PORT", "7687"))
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
-NEO4J_DB = os.getenv("NEO4J_DB", "neo4j")
-
-def get_driver():
-    """Get a Neo4j driver instance."""
-    from neo4j import GraphDatabase
-    return GraphDatabase.driver(
-        f"bolt://{NEO4J_HOST}:{NEO4J_PORT}",
-        auth=(NEO4J_USER, NEO4J_PASS)
-    )
+# Neo4j configuration lives in graph_rag.config — import get_driver/NEO4J_DB
+# from there. This module only handles llama.cpp server settings.
 
 class ServerSettings(BaseModel):
     model_path: str

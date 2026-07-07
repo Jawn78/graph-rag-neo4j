@@ -19,62 +19,69 @@ cli.add_command(setup_group, name='setup')
 
 @cli.command()
 @click.argument('files', type=click.Path(exists=True, path_type=Path), nargs=-1, required=True)
-@click.option('--chunk-size', type=int, default=512, help='Size of text chunks for embedding')
-@click.option('--overlap', type=int, default=50, help='Number of tokens to overlap between chunks')
-def ingest(files: tuple[Path, ...], chunk_size: int, overlap: int):
+def ingest(files: tuple):
     """Ingest documents into the graph database.
-    
+
     Examples:
         python -m graph_rag ingest docs/*.pdf             # Ingest all PDFs
         python -m graph_rag ingest report.pdf memo.docx   # Ingest specific files
-        python -m graph_rag ingest --chunk-size 1024 *.md # Custom chunk size
     """
-    from .ingest import DocumentIngestor
-    
+    from .config import get_driver, detect_embedding_dim
+    from .graph.schema import ensure_schema
+    from .ingest import ingest_files
+    from .utils.logging import configure_logging
+
+    configure_logging()
     with console.status("[bold green]Ingesting documents..."):
-        ingestor = DocumentIngestor()
-        result = ingestor.ingest_files(list(files), chunk_size, overlap)
-        
-        if result["success"]:
-            console.print(Panel.fit(
-                f"[green]✓[/] Successfully ingested documents:\n"
-                f"  • Files processed: {result['files_processed']}\n"
-                f"  • Chunks created: {result['chunks_created']}\n"
-                f"  • Graph nodes: {result['nodes_created']}\n"
-                f"  • Relationships: {result['relationships_created']}",
-                title="Ingestion Complete",
-                border_style="green"
-            ))
-        else:
-            console.print("[red]Error during ingestion:[/]", result.get("error", "Unknown error"))
+        try:
+            driver = get_driver()
+            ensure_schema(driver, detect_embedding_dim())
+            n_docs, n_chunks = ingest_files(driver, [str(f) for f in files])
+        except Exception as e:
+            console.print(f"[red]Error during ingestion:[/] {e}")
+            raise SystemExit(1)
+
+    console.print(Panel.fit(
+        f"[green]✓[/] Successfully ingested documents:\n"
+        f"  • Documents: {n_docs}\n"
+        f"  • Chunks with embeddings: {n_chunks}",
+        title="Ingestion Complete",
+        border_style="green"
+    ))
 
 @cli.command()
 @click.option('--question', '-q', required=True, help='The question to answer')
-@click.option('--max-results', type=int, default=5, help='Maximum number of relevant chunks to retrieve')
-@click.option('--show-sources', is_flag=True, help='Show source documents and context')
-def ask(question: str, max_results: int, show_sources: bool):
+@click.option('--max-results', type=int, default=6, help='Maximum number of relevant chunks to retrieve')
+@click.option('--show-sources', is_flag=True, help='Show source citations')
+@click.option('--use-mcp', is_flag=True, help='Try MCP agent gateway before the local chat model')
+def ask(question: str, max_results: int, show_sources: bool, use_mcp: bool):
     """Ask a question using the RAG system.
-    
+
     Examples:
         python -m graph_rag ask -q "What is RAG?"
         python -m graph_rag ask -q "Explain the architecture" --show-sources
         python -m graph_rag ask -q "List main features" --max-results 10
     """
-    from .qa import QuestionAnswerer
-    
+    from .config import get_driver
+    from .qa import ask as answer_question
+    from .utils.logging import configure_logging
+
+    configure_logging()
     with console.status("[bold green]Thinking..."):
-        qa = QuestionAnswerer()
-        result = qa.answer_question(question, max_results)
-        
-        # Display the answer
-        console.print("\n[bold cyan]Answer:[/]")
-        console.print(Markdown(result["answer"]))
-        
-        # Display sources if requested
-        if show_sources and result["sources"]:
-            console.print("\n[bold]Sources:[/]")
-            for i, source in enumerate(result["sources"], 1):
-                console.print(f"{i}. {source}")
+        driver = get_driver()
+        result = answer_question(driver, question, top_k=max_results, use_mcp=use_mcp)
+
+    if result.get("error"):
+        console.print(f"[red]Error:[/] {result['error']}")
+        raise SystemExit(1)
+
+    console.print("\n[bold cyan]Answer:[/]")
+    console.print(Markdown(result["answer"] or "(no answer)"))
+
+    if show_sources and result.get("citations"):
+        console.print("\n[bold]Sources:[/]")
+        for i, source in enumerate(result["citations"], 1):
+            console.print(f"{i}. {source}")
 
 @cli.command()
 def check():
