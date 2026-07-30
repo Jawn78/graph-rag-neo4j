@@ -1,15 +1,9 @@
-import os
-import time
 import click
-from pathlib import Path
 from typing import Dict
 from rich.console import Console
 from rich.table import Table
-from rich.progress import track
 from rich.panel import Panel
-from rich.live import Live
-from rich import print as rprint
-from . import setup_environment, verify_environment, ServerManager, Config
+from . import setup_environment, verify_environment
 
 console = Console()
 

@@ -21,10 +21,19 @@ wheels/
 
 # Virtual Environment
 .env
-.venv
+.venv*/
 env/
 venv/
 ENV/
+
+# Vendored builds (clone manually per BUILD_WITH_CUDA.md)
+llama.cpp/
+llama-cpp-python/
+
+# Local caches / runtime data
+embed_cache.sqlite*
+.feedback/
+.profiles/
 
 # VS Code
 .vscode/

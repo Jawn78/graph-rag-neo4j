@@ -1,16 +1,52 @@
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "graph_rag2"
-version = "0.1.0"
+name = "graph-rag-neo4j"
+version = "0.2.0"
 description = "A Graph-based RAG system using Neo4j"
-requires-python = ">=3.8"
+readme = "README.md"
+# tuple[...] / list[...] builtin generics are used throughout -> 3.9 minimum
+requires-python = ">=3.9"
 dependencies = [
     "click>=8.1.0",
     "rich>=13.0.0",
+    "neo4j>=5.20",
+    "openai>=1.40",
+    "python-dotenv>=1.0",
+    "requests>=2.31.0",
+    "pydantic>=2.0.0",
+    "psutil>=5.9.0",
 ]
 
-[tool.setuptools]
-packages = ["graph_rag"]
+[project.optional-dependencies]
+ingest = [
+    "pypdf>=4.0",
+    "docx2txt>=0.8",
+    "chardet>=5.2",
+]
+dev = [
+    "pytest>=7.4.0",
+    "ruff>=0.4",
+]
+rerank = [
+    "sentence-transformers>=2.2",
+]
+
+[project.scripts]
+graph-rag = "graph_rag.__main__:cli"
+
+[tool.setuptools.packages.find]
+include = ["graph_rag*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+# Correctness-focused: pyflakes + syntax/runtime error classes
+select = ["E4", "E7", "E9", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

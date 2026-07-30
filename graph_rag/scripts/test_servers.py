@@ -1,7 +1,5 @@
 """Test script to verify GPU support in both embedding and chat servers."""
-import os
 import sys
-import json
 from openai import OpenAI
 
 def test_server(base_url: str, model_name: str, is_embedding: bool = False):

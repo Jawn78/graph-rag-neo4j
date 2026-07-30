@@ -2,11 +2,9 @@
 """
 Standalone script to clean corrupted text from the graph RAG database.
 """
-import sys
-import os
 import re
 
-from graph_rag.setup.config import get_driver, NEO4J_DB
+from graph_rag.config import get_driver, close_driver, NEO4J_DB
 
 def _sanitize_text(text: str) -> str:
     """Sanitize text for database storage."""
@@ -55,7 +53,8 @@ def _is_corrupted_text(text: str) -> bool:
 def clean_corrupted_data(dry_run=False):
     """Clean corrupted text from the database."""
     
-    with get_driver() as drv:
+    drv = get_driver()
+    try:
         with drv.session(database=NEO4J_DB) as s:
             # Find chunks with potentially corrupted text
             chunks = s.run("""
@@ -163,9 +162,11 @@ def clean_corrupted_data(dry_run=False):
             if dry_run:
                 print(f"[DRY RUN] Found {corrupted_count} corrupted chunks and {doc_corrupted_count} corrupted documents")
             else:
-                print(f"[CLEAN] Results:")
+                print("[CLEAN] Results:")
                 print(f"  Chunks: {corrupted_count} corrupted, {cleaned_count} cleaned, {deleted_count} deleted")
                 print(f"  Documents: {doc_corrupted_count} corrupted, {doc_cleaned_count} cleaned, {doc_deleted_count} deleted")
+    finally:
+        close_driver()
 
 if __name__ == "__main__":
     import argparse
